@@ -1,0 +1,11 @@
+{
+  "name": "open-shaders-fsmp-wind",
+  "version-string": "0.2.1",
+  "dependencies": [
+    "bullet3",
+    "spdlog",
+    "directxtk",
+    "directxmath",
+    "rapidcsv"
+  ]
+}

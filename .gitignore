@@ -1,0 +1,5 @@
+/build*/
+/.vs/
+/vcpkg_installed/
+*.pdb
+*.obj

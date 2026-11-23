@@ -1,0 +1,43 @@
+Source-level PDB inspection (2026-11-23): two baseline DLL/PDB pairs.
+These are known compatible layout baselines, NOT a runtime allowlist. Future
+builds can pass iff the installed DLL/PDB match and checked ABI stays stable.
+
+Build A: DaymareOn FSMP 4.1.1 AVX
+  DLL SHA256: ff9c7f3f78eca122ac0aa9bd58a0628d7200685f86ef63fbd18bfe7f2c6d667f
+  RSDS GUID: f76f8a22-a848-4e46-b6ab-74572d0ff3b2
+  RSDS Age: 1
+Build B: user-supplied FSMP-fork AVX (flobrim-vs2026-avx-main)
+  DLL SHA256: 183cdbe565e8f3c1c17e1e9b54a040e3cbad05fe1d6f3579f20ecaae2127aac2
+  RSDS GUID: 9f5fe5e5-3e0d-4d98-8faf-56811e6cb894
+  RSDS Age: 12
+
+Both uploaded PDB GUIDs and ages EXACTLY match their respective DLL RSDS records.
+Direct parsing of the PDB TPI records confirms these type sizes in BOTH:
+  sizeof(btRigidBody) = 0x310
+  sizeof(hdt::SkinnedMeshBone) = 0x410
+  sizeof(hdt::SkinnedMeshSystem) = 0x98
+  sizeof(hdt::SkinnedMeshWorld) = 0x290
+  sizeof(hdt::SkyrimSystem) = 0xC0
+  sizeof(hdt::SkyrimBone) = 0x430
+  sizeof(hdt::SkyrimPhysicsWorld) = 0x400
+
+Direct parsing of field-list type records confirms these offsets in BOTH:
+  hdt::SkinnedMeshBone::m_name = 0x18
+  hdt::SkinnedMeshBone::m_windFactor = 0x2C
+  hdt::SkinnedMeshBone::m_rig = 0x30
+  hdt::SkinnedMeshSystem::m_world = 0x28
+  hdt::SkinnedMeshSystem::m_bones = 0x38
+  hdt::SkinnedMeshWorld::m_systems = 0x228
+  hdt::SkyrimSystem::m_skeleton = 0x98
+  hdt::SkyrimBone::m_node = 0x418
+
+Runtime checks these fields, bone name and wind factor, vector and bone-member
+sizes, and Bullet's exact rigid-body size with DbgHelp and requires the loaded
+adjacent PDB GUID/age to match the loaded DLL's CodeView RSDS identity. It
+resolves hdt::SkyrimPhysicsWorld::get() dynamically.
+Both binaries contain that symbol in their PDB. The runtime still requires
+in-game verification and WILL fail closed if function lookup/layout checks fail.
+The PDB must be beside the FSMP DLL at runtime, named hdtsmp64.pdb.
+
+No user-supplied FSMP binary/PDB is distributed in this source archive.
+Windows compilation and Skyrim runtime behavior remain untested here.
