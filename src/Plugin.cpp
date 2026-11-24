@@ -64,6 +64,11 @@ struct Settings {
     float shelterFivePointDistance{900.f};
     float transientThreshold{0.02f};
     bool allowWorldFallback{true};
+    // Invalidate actor/NiNode caches before cell transitions. This deliberately
+    // does not change the ordinary wind force or shelter calculations.
+    bool pauseDuringLoading{true};
+    bool resetOnReferenceDetach{true};
+    int transitionWarmupSteps{60};
     // Master switch gates all wind-plugin messages and its SKSE logfile.
     // Diagnostic-specific switches cannot override this setting.
     bool enableLogging{false};
@@ -116,6 +121,9 @@ void LoadSettings(){
     g_settings.shelterFivePointDistance=std::max(g_settings.shelterFivePointDistance,g_settings.shelterThreePointDistance+1.f);
     g_settings.transientThreshold=ReadFloat("TransientThreshold",0.02f,0.001f,1.0f);
     g_settings.allowWorldFallback=ReadInt("AllowUnmeasuredWorldAreaFallback",1)!=0;
+    g_settings.pauseDuringLoading=ReadInt("PauseDuringLoadingMenu",1)!=0;
+    g_settings.resetOnReferenceDetach=ReadInt("ResetOnReferenceDetach",1)!=0;
+    g_settings.transitionWarmupSteps=std::clamp(ReadInt("TransitionWarmupPhysicsSteps",60),0,600);
     g_settings.enableLogging=ReadInt("EnableLogging",0)!=0;
     g_settings.logEvery=std::clamp(ReadInt("LogEveryNFrames",0),0,1000000);
     g_settings.logAreaDiagnostics=ReadInt("LogMissingAreaDiagnostics",0)!=0;
@@ -359,36 +367,76 @@ public:
         wind_.store(nullptr,std::memory_order_release);
         if(smp_){smp_->removeListener(this);smp_=nullptr;}
     }
-    // Pause new callbacks immediately, then wait for any already-running
-    // PreStep to complete BEFORE Skyrim can tear down old-save physics/scene
-    // objects. We must not defer NiPointer release until the next PreStep:
-    // Skyrim might have destroyed the old save's actor graph by then.
-    void OnPreLoadGame(){
+    // All teardown paths take stepMutex_ before destroying cached NiPointers.
+    // kPreLoadGame is not dispatched by fast travel, so Loading Menu opening
+    // must use the same synchronisation and old-scene invalidation.
+    void QuiesceAndReset(const char* reason){
         sessionPaused_.store(true,std::memory_order_release);
         sceneEpoch_.fetch_add(1,std::memory_order_acq_rel);
-        WIND_LOG_INFO("Save transition: suspending wind; waiting for active PreStep");
+        std::lock_guard stepLock(stepMutex_);
         {
-            std::lock_guard stepLock(stepMutex_);
-            {
-                // Discard queued game-thread work while old scene nodes are
-                // still valid. Queued callbacks never capture these pointers.
-                std::lock_guard pendingLock(pendingSceneMutex_);
-                pendingScene_.reset();
-            }
-            ResetRuntimeState();
-            osfsmp::RequestSceneCacheReset();
+            std::lock_guard pendingLock(pendingSceneMutex_);
+            pendingScene_.reset();
         }
-        WIND_LOG_INFO("Save transition: old-save state released before teardown");
+        ResetRuntimeState();
+        osfsmp::RequestSceneCacheReset();
+        WIND_LOG_INFO("Scene transition: paused and invalidated old-scene caches ({})",reason);
+    }
+    void OnPreLoadGame(){
+        saveLoadInProgress_.store(true,std::memory_order_release);
+        QuiesceAndReset("pre-load game");
     }
     void OnPostLoadGame(){
-        // PreLoad has already cleared old-save cached references. Resume only
-        // once Skyrim signals post-load; never try to release them after load.
-        sessionPaused_.store(false,std::memory_order_release);
-        WIND_LOG_INFO("Save transition: wind resumes with fresh systems on next PreStep");
+        // A save may finish loading while Loading Menu is still visible.
+        // Do not resume until both lifecycle signals agree.
+        std::lock_guard stepLock(stepMutex_);
+        saveLoadInProgress_.store(false,std::memory_order_release);
+        warmupSteps_=g_settings.transitionWarmupSteps;
+        if(!loadingMenuOpen_.load(std::memory_order_acquire))
+            sessionPaused_.store(false,std::memory_order_release);
+        WIND_LOG_INFO("Scene transition: save post-load, menuOpen={}, warmupSteps={}",
+            loadingMenuOpen_.load(),warmupSteps_);
     }
     void OnNewGame(){
         OnPreLoadGame();
         OnPostLoadGame();
+    }
+    void OnLoadingMenu(bool opening){
+        if(!g_settings.pauseDuringLoading)return;
+        if(opening){
+            loadingMenuOpen_.store(true,std::memory_order_release);
+            QuiesceAndReset("loading menu opened");
+        } else {
+            std::lock_guard stepLock(stepMutex_);
+            loadingMenuOpen_.store(false,std::memory_order_release);
+            warmupSteps_=g_settings.transitionWarmupSteps;
+            if(!saveLoadInProgress_.load(std::memory_order_acquire))
+                sessionPaused_.store(false,std::memory_order_release);
+            WIND_LOG_INFO("Scene transition: loading menu closed, warmupSteps={}",warmupSteps_);
+        }
+    }
+    void OnReferenceDetaching(RE::FormID reference){
+        if(!g_settings.resetOnReferenceDetach || !reference ||
+           sessionPaused_.load(std::memory_order_acquire))return;
+        // Only invalidate if this plugin previously mapped the reference to an
+        // authoritative FSMP bone. Other cell streaming events are ignored.
+        std::lock_guard stepLock(stepMutex_);
+        if(sessionPaused_.load(std::memory_order_acquire))return;
+        const bool relevant=std::any_of(meta_.begin(),meta_.end(),[reference](const BodyMetadata& m){
+            return m.reference==reference;
+        });
+        if(!relevant)return;
+        sceneEpoch_.fetch_add(1,std::memory_order_acq_rel);
+        {
+            std::lock_guard pendingLock(pendingSceneMutex_);
+            pendingScene_.reset();
+        }
+        ResetRuntimeState();
+        osfsmp::RequestSceneCacheReset();
+        // Cell detach can be followed by several frames of streaming; avoid
+        // scanning or reusing stale roots immediately after the detach event.
+        warmupSteps_=g_settings.transitionWarmupSteps;
+        WIND_LOG_INFO("Scene transition: FSMP reference {:08X} detached; caches cleared",reference);
     }
     RE::BSEventNotifyControl ProcessEvent(const hdt::PreStepEvent* event,
         RE::BSTEventSource<hdt::PreStepEvent>*) override
@@ -404,6 +452,12 @@ public:
         if(entryEpoch!=sceneEpoch_.load(std::memory_order_acquire) ||
            sessionPaused_.load(std::memory_order_acquire))
             return RE::BSEventNotifyControl::kContinue;
+        // Warm-up counts actual FSMP PreStep calls, not wall time; neither
+        // scene-graph traversal nor Bullet force is performed while it runs.
+        if(warmupSteps_>0){
+            --warmupSteps_;
+            return RE::BSEventNotifyControl::kContinue;
+        }
         auto* shaders=wind_.load(std::memory_order_acquire);
         if(!shaders)return RE::BSEventNotifyControl::kContinue;
         const float dt=std::isfinite(event->timeStep)?std::clamp(event->timeStep,0.f,0.1f):0.f;
@@ -979,10 +1033,17 @@ private:
                 work.emplace(std::move(*pendingScene_));
                 pendingScene_.reset();
             }
-            // SKSE normal tasks execute on the game thread. A scan already
-            // running there completes before the next pre-load message.
+            // SKSE normal tasks execute on the game thread. Reject tasks that
+            // began before a menu/world transition, even if the pause callback
+            // is delayed by the UI event dispatch order.
             if(sceneEpoch_.load(std::memory_order_acquire)!=epoch ||
                sessionPaused_.load(std::memory_order_acquire))return;
+            if(auto* ui=RE::UI::GetSingleton();
+               ui && ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME)){
+                if(activeScanTicket_.load(std::memory_order_acquire)==ticket)
+                    scanPending_.store(false,std::memory_order_release);
+                return;
+            }
             auto results=osfsmp::ScanScene(work->bodies,work->probes,
                                             work->selfProbes,work->options);
             {
@@ -1206,6 +1267,9 @@ private:
     std::unordered_map<std::uintptr_t,SystemMetadata> systems_;
     std::atomic<bool> scanPending_{false};
     std::atomic<bool> sessionPaused_{false};
+    std::atomic<bool> loadingMenuOpen_{false};
+    std::atomic<bool> saveLoadInProgress_{false};
+    int warmupSteps_{0};  // protected by stepMutex_
     std::atomic<std::uint64_t> sceneEpoch_{1};
     std::atomic<std::uint64_t> activeScanTicket_{0};
     std::uint64_t nextScanTicket_{};
@@ -1224,6 +1288,29 @@ private:
     float maxBaseResponse_{},maxAppliedForce_{};
 };
 WindAdapter g_adapter;
+
+// These event sources cover transitions not reported as SKSE save loads.
+// The callback does not touch scene graph data; the adapter serializes any
+// release of cached NiPointers with its active FSMP PreStep callback.
+class SceneTransitionSink final :
+    public RE::BSTEventSink<RE::MenuOpenCloseEvent>,
+    public RE::BSTEventSink<RE::TESCellAttachDetachEvent> {
+public:
+    RE::BSEventNotifyControl ProcessEvent(const RE::MenuOpenCloseEvent* event,
+        RE::BSTEventSource<RE::MenuOpenCloseEvent>*) override {
+        if(event && event->menuName==RE::LoadingMenu::MENU_NAME)
+            g_adapter.OnLoadingMenu(event->opening);
+        return RE::BSEventNotifyControl::kContinue;
+    }
+    RE::BSEventNotifyControl ProcessEvent(const RE::TESCellAttachDetachEvent* event,
+        RE::BSTEventSource<RE::TESCellAttachDetachEvent>*) override {
+        if(event && !event->attached && event->reference)
+            g_adapter.OnReferenceDetaching(event->reference->GetFormID());
+        return RE::BSEventNotifyControl::kContinue;
+    }
+};
+SceneTransitionSink g_transitionSink;
+
 // FSMP dispatches MSG_STARTUP during its PostPostLoad initialization. Check only
 // at DataLoaded, after the normal opportunity for that message has passed.
 // Keep this independent of private-ABI validation: receiving MSG_STARTUP with
@@ -1258,6 +1345,10 @@ void OnMessage(SKSE::MessagingInterface::Message* msg){
                 WIND_LOG_ERROR("Could not subscribe to FSMP startup message");
             break;
         case SKSE::MessagingInterface::kDataLoaded:
+            if(auto* ui=RE::UI::GetSingleton())
+                ui->AddEventSink<RE::MenuOpenCloseEvent>(&g_transitionSink);
+            if(auto* holder=RE::ScriptEventSourceHolder::GetSingleton())
+                holder->AddEventSink<RE::TESCellAttachDetachEvent>(&g_transitionSink);
             if(!g_fsmpStartupSeen.load(std::memory_order_acquire) &&
                !g_fsmpMissingStartupWarned.exchange(true,std::memory_order_acq_rel)){
                 WIND_LOG_WARN("FSMP MSG_STARTUP not received by SKSE DataLoaded; wind integration unavailable. Check hdtsmp64.dll loading and FSMP startup logs");
