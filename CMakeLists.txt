@@ -4,6 +4,26 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Save-switch source overlay: apply the guarded v0.3.4 fix on configure.
+# This makes the ZIP usable as an overwrite package without a manual copy of
+# a 1200-line translation unit. The script preserves a .pre-savefix backup,
+# is idempotent, and refuses to edit unexpected source versions.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/apply-save-switch-fix.py")
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/apply-save-switch-fix.py"
+                --source "${CMAKE_CURRENT_SOURCE_DIR}/src/Plugin.cpp"
+        RESULT_VARIABLE OSFSMPWIND_PATCH_RESULT
+        OUTPUT_VARIABLE OSFSMPWIND_PATCH_OUTPUT
+        ERROR_VARIABLE OSFSMPWIND_PATCH_ERROR
+    )
+    if(NOT OSFSMPWIND_PATCH_RESULT EQUAL 0)
+        message(FATAL_ERROR "Save-switch source patch failed:\n${OSFSMPWIND_PATCH_ERROR}")
+    endif()
+    string(STRIP "${OSFSMPWIND_PATCH_OUTPUT}" OSFSMPWIND_PATCH_OUTPUT)
+    message(STATUS "${OSFSMPWIND_PATCH_OUTPUT}")
+endif()
+
 # An existing installation is FIRST-CLASS. CMake never rewrites that source tree.
 set(CommonLibSSEPath_NG "" CACHE PATH "Existing CommonLibSSE-NG source checkout")
 if(NOT CommonLibSSEPath_NG AND DEFINED ENV{CommonLibSSEPath_NG})
@@ -72,12 +92,27 @@ set_target_properties(OpenShadersFSMPWind PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/SKSE/Plugins"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/SKSE/Plugins"
 )
+
+# Generate a matching *wind plugin* linker PDB in Release too. /Zi adds
+# object-level debug info; /DEBUG:FULL produces the portable full linker PDB.
+# This does not replace the separate hdtsmp64.pdb required for FSMP ABI checks.
+if(MSVC)
+    target_compile_options(OpenShadersFSMPWind PRIVATE /Zi)
+    target_link_options(OpenShadersFSMPWind PRIVATE /DEBUG:FULL)
+    set_target_properties(OpenShadersFSMPWind PROPERTIES
+        PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/SKSE/Plugins"
+    )
+endif()
+
 # Deliberately don't link another Bullet runtime into this SKSE DLL: calls used
 # here are inline, and all objects belong to the already-loaded FSMP Bullet.
 # If a non-inline symbol becomes necessary, don't link arbitrary Bullet libraries
 # without first checking whether that could introduce incompatible runtimes.
 
 install(TARGETS OpenShadersFSMPWind RUNTIME DESTINATION SKSE/Plugins)
+if(MSVC)
+    install(FILES "$<TARGET_PDB_FILE:OpenShadersFSMPWind>" DESTINATION SKSE/Plugins)
+endif()
 install(FILES "Data/SKSE/Plugins/OpenShadersFSMPWind.ini" DESTINATION SKSE/Plugins)
 
 option(OSFSMPWIND_BUILD_MATH_TESTS "Build portable wind math sanity tests" OFF)

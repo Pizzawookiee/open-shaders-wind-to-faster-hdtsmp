@@ -284,6 +284,20 @@ struct SystemMetadata {
     bool selfAmbientMeasured{},selfTransientMeasured{};
 };
 
+// SAVE-SWITCH-FIX: pre-load quiescence and detached scene work
+// Pending game-thread scans belong to the adapter, not to queued lambdas.
+// This lets kPreLoadGame release all NiPointer references from the old save
+// before Skyrim tears down the old actor scene graph. An obsolete task holds
+// only an epoch and ticket, never references to old actors or nodes.
+struct PendingSceneWork {
+    std::uint64_t epoch{};
+    std::uint64_t ticket{};
+    std::vector<osfsmp::BodyRequest> bodies;
+    std::vector<osfsmp::ShelterRequest> probes;
+    std::vector<osfsmp::SelfShelterRequest> selfProbes;
+    osfsmp::SceneOptions options{};
+};
+
 class WindAdapter final : public hdt::IPreStepListener {
 public:
     void SetFSMP(hdt::PluginInterface* api){
@@ -333,20 +347,32 @@ public:
         wind_.store(nullptr,std::memory_order_release);
         if(smp_){smp_->removeListener(this);smp_=nullptr;}
     }
-    // SKSE save transitions run on a different lifecycle than FSMP's physics
-    // callback. Gate work atomically here; release NiPointers and rebuild all
-    // private-ABI-backed metadata on the first safe PreStep after load.
+    // Pause new callbacks immediately, then wait for any already-running
+    // PreStep to complete BEFORE Skyrim can tear down old-save physics/scene
+    // objects. We must not defer NiPointer release until the next PreStep:
+    // Skyrim might have destroyed the old save's actor graph by then.
     void OnPreLoadGame(){
         sessionPaused_.store(true,std::memory_order_release);
         sceneEpoch_.fetch_add(1,std::memory_order_acq_rel);
-        resetRequired_.store(true,std::memory_order_release);
-        osfsmp::RequestSceneCacheReset();
-        logger::info("Save transition: suspending wind and invalidating queued scene scans");
+        logger::info("Save transition: suspending wind; waiting for active PreStep");
+        {
+            std::lock_guard stepLock(stepMutex_);
+            {
+                // Discard queued game-thread work while old scene nodes are
+                // still valid. Queued callbacks never capture these pointers.
+                std::lock_guard pendingLock(pendingSceneMutex_);
+                pendingScene_.reset();
+            }
+            ResetRuntimeState();
+            osfsmp::RequestSceneCacheReset();
+        }
+        logger::info("Save transition: old-save state released before teardown");
     }
     void OnPostLoadGame(){
-        resetRequired_.store(true,std::memory_order_release);
+        // PreLoad has already cleared old-save cached references. Resume only
+        // once Skyrim signals post-load; never try to release them after load.
         sessionPaused_.store(false,std::memory_order_release);
-        logger::info("Save transition: wind will rebuild authoritative systems on next PreStep");
+        logger::info("Save transition: wind resumes with fresh systems on next PreStep");
     }
     void OnNewGame(){
         OnPreLoadGame();
@@ -355,11 +381,14 @@ public:
     RE::BSEventNotifyControl ProcessEvent(const hdt::PreStepEvent* event,
         RE::BSTEventSource<hdt::PreStepEvent>*) override
     {
+        // Serializes the entire Bullet/NiPointer callback with pre-load.
+        // Without this, pre-load can clear metadata or unload actors while
+        // a callback that passed the initial paused check is still active.
+        std::lock_guard stepLock(stepMutex_);
         if(!event || !smp_ || !g_settings.enabled ||
            sessionPaused_.load(std::memory_order_acquire))
             return RE::BSEventNotifyControl::kContinue;
         const auto entryEpoch=sceneEpoch_.load(std::memory_order_acquire);
-        if(resetRequired_.exchange(false,std::memory_order_acq_rel)) ResetRuntimeState();
         if(entryEpoch!=sceneEpoch_.load(std::memory_order_acquire) ||
            sessionPaused_.load(std::memory_order_acquire))
             return RE::BSEventNotifyControl::kContinue;
@@ -533,9 +562,9 @@ public:
     }
 private:
     void ResetRuntimeState(){
-        // Runs on the FSMP PreStep thread, never in a load-message callback.
-        // Late tasks from earlier saves carry a different epoch and cannot
-        // clear scanPending_ or publish old results into the new session.
+        // Called from the SKSE pre-load message with stepMutex_ held, before
+        // old-save scene graph / physics objects are destroyed. Queued tasks
+        // carry no NiPointers and are rejected by epoch/ticket checks.
         {
             std::lock_guard lock(resultLock_);
             completed_={};
@@ -917,14 +946,33 @@ private:
         }
         const auto ticket=++nextScanTicket_;
         activeScanTicket_.store(ticket,std::memory_order_release);
-        tasks->AddTask([this,epoch,ticket,items=std::move(bodies),probes=std::move(probes),
-                        selfProbes=std::move(selfProbes),options]() mutable {
-            // Do not call GetUserData()/Get3D()/Havok on old save's nodes
-            // after kPreLoadGame. Holding NiPointers alone cannot keep the
-            // underlying TESObjectREFR or bhkWorld alive through a load.
+        {
+            std::lock_guard pendingLock(pendingSceneMutex_);
+            // The physics callback holds stepMutex_ while queueing. A pre-load
+            // cannot concurrently clear/reuse this slot until we finish.
+            pendingScene_.emplace(PendingSceneWork{
+                epoch,ticket,std::move(bodies),std::move(probes),
+                std::move(selfProbes),options});
+        }
+        tasks->AddTask([this,epoch,ticket]() {
+            // This callback captures NO NiPointers. A pre-load can destroy
+            // its pending payload safely before the old scene is unloaded.
+            std::optional<PendingSceneWork> work;
+            {
+                std::lock_guard pendingLock(pendingSceneMutex_);
+                if(!pendingScene_ || pendingScene_->epoch!=epoch ||
+                   pendingScene_->ticket!=ticket ||
+                   sceneEpoch_.load(std::memory_order_acquire)!=epoch ||
+                   sessionPaused_.load(std::memory_order_acquire))return;
+                work.emplace(std::move(*pendingScene_));
+                pendingScene_.reset();
+            }
+            // SKSE normal tasks execute on the game thread. A scan already
+            // running there completes before the next pre-load message.
             if(sceneEpoch_.load(std::memory_order_acquire)!=epoch ||
                sessionPaused_.load(std::memory_order_acquire))return;
-            auto results=osfsmp::ScanScene(items,probes,selfProbes,options);
+            auto results=osfsmp::ScanScene(work->bodies,work->probes,
+                                            work->selfProbes,work->options);
             {
                 std::lock_guard lock(resultLock_);
                 if(sceneEpoch_.load(std::memory_order_acquire)!=epoch ||
@@ -1133,6 +1181,11 @@ private:
             maxBaseResponse_,appliedThisStep_,maxAppliedForce_,shelterPoints,multiProbeSystems,
             selfProbeBatches_,withSkeletonAxes,withFallback);
     }
+    // Pre-load takes this lock after first setting sessionPaused_, so it
+    // cannot invalidate objects underneath an already-running PreStep.
+    std::mutex stepMutex_;
+    std::mutex pendingSceneMutex_;
+    std::optional<PendingSceneWork> pendingScene_;
     hdt::PluginInterface* smp_{};
     std::atomic<CSPluginAPI::ICSInterface001*> wind_{nullptr};
     std::unordered_map<btRigidBody*,std::size_t> index_;
@@ -1141,7 +1194,6 @@ private:
     std::unordered_map<std::uintptr_t,SystemMetadata> systems_;
     std::atomic<bool> scanPending_{false};
     std::atomic<bool> sessionPaused_{false};
-    std::atomic<bool> resetRequired_{false};
     std::atomic<std::uint64_t> sceneEpoch_{1};
     std::atomic<std::uint64_t> activeScanTicket_{0};
     std::uint64_t nextScanTicket_{};
