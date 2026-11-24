@@ -64,14 +64,25 @@ struct Settings {
     float shelterFivePointDistance{900.f};
     float transientThreshold{0.02f};
     bool allowWorldFallback{true};
-    int logEvery{600};
+    // Master switch gates all wind-plugin messages and its SKSE logfile.
+    // Diagnostic-specific switches cannot override this setting.
+    bool enableLogging{false};
+    int logEvery{0};
     // Read-only per-bone force-accumulator diagnostic, rate-limited by default.
-    bool logAreaDiagnostics{true};
-    bool logBoneForces{true};
+    bool logAreaDiagnostics{false};
+    bool logBoneForces{false};
     int boneForceLogEvery{600};
     int boneForceLogMaxEntries{64}; // 0 logs every evaluated bone.
 };
 Settings g_settings{};
+
+// Use a lazy conditional at every call site. When logging is disabled, none of
+// the arguments to logger::info/warn/error is evaluated or formatted. This is
+// intentionally independent of the per-diagnostic sampling switches below.
+#define WIND_LOG_INFO(...) do { if (g_settings.enableLogging) logger::info(__VA_ARGS__); } while (false)
+#define WIND_LOG_WARN(...) do { if (g_settings.enableLogging) logger::warn(__VA_ARGS__); } while (false)
+#define WIND_LOG_ERROR(...) do { if (g_settings.enableLogging) logger::error(__VA_ARGS__); } while (false)
+
 std::string ConfigPath(){
     return (std::filesystem::current_path()/"Data"/"SKSE"/"Plugins"/"OpenShadersFSMPWind.ini").string();
 }
@@ -105,9 +116,10 @@ void LoadSettings(){
     g_settings.shelterFivePointDistance=std::max(g_settings.shelterFivePointDistance,g_settings.shelterThreePointDistance+1.f);
     g_settings.transientThreshold=ReadFloat("TransientThreshold",0.02f,0.001f,1.0f);
     g_settings.allowWorldFallback=ReadInt("AllowUnmeasuredWorldAreaFallback",1)!=0;
-    g_settings.logEvery=std::clamp(ReadInt("LogEveryNFrames",600),0,1000000);
-    g_settings.logAreaDiagnostics=ReadInt("LogMissingAreaDiagnostics",1)!=0;
-    g_settings.logBoneForces=ReadInt("LogBoneForces",1)!=0;
+    g_settings.enableLogging=ReadInt("EnableLogging",0)!=0;
+    g_settings.logEvery=std::clamp(ReadInt("LogEveryNFrames",0),0,1000000);
+    g_settings.logAreaDiagnostics=ReadInt("LogMissingAreaDiagnostics",0)!=0;
+    g_settings.logBoneForces=ReadInt("LogBoneForces",0)!=0;
     g_settings.boneForceLogEvery=std::clamp(ReadInt("BoneForceLogEveryNFrames",600),1,1000000);
     g_settings.boneForceLogMaxEntries=std::clamp(ReadInt("BoneForceLogMaxEntries",64),0,16384);
 }
@@ -307,41 +319,41 @@ public:
             info.bulletVersion.major!=hdt::PluginInterface::BULLET_VERSION.major ||
             info.bulletVersion.minor!=hdt::PluginInterface::BULLET_VERSION.minor ||
             info.bulletVersion.patch!=hdt::PluginInterface::BULLET_VERSION.patch){
-            logger::error("FSMP public interface or Bullet ABI mismatch; disabled");return;
+            WIND_LOG_ERROR("FSMP public interface or Bullet ABI mismatch; disabled");return;
         }
         std::string error, abiDetails;
         if(!osfsmp::InitializeWorldABI(error, &abiDetails)){
-            logger::error("FSMP private system ABI unavailable: {}",error);return;
+            WIND_LOG_ERROR("FSMP private system ABI unavailable: {}",error);return;
         }
         std::uint16_t major{}, minor{}, patch{};
         if (GetFSMPFileVersion(major, minor, patch)) {
-            logger::info("FSMP PDB-verified ABI compatible: FileVersion={}.{}.{}, {}",
+            WIND_LOG_INFO("FSMP PDB-verified ABI compatible: FileVersion={}.{}.{}, {}",
                          major, minor, patch, abiDetails);
         } else {
             // FILEVERSION is advisory: a compatible rebuild need not keep it.
-            logger::info("FSMP PDB-verified ABI compatible (no FILEVERSION), {}", abiDetails);
+            WIND_LOG_INFO("FSMP PDB-verified ABI compatible (no FILEVERSION), {}", abiDetails);
         }
         smp_=api;
         smp_->addListener(this);
-        logger::info("FSMP system-level private ABI ready; subscribed to PreStep");
+        WIND_LOG_INFO("FSMP system-level private ABI ready; subscribed to PreStep");
     }
     void ConnectShaders(){
         if(!g_settings.enabled)return;
         if(IsCommunityShadersExpanded()){
-            logger::error("Detected incompatible Community Shaders Expanded; wind disabled");return;
+            WIND_LOG_ERROR("Detected incompatible Community Shaders Expanded; wind disabled");return;
         }
         auto* messaging=SKSE::GetMessagingInterface();
         CSPluginAPI::CSMessage msg{};
         if(!messaging || !messaging->Dispatch(CSPluginAPI::CSInterfaceMessageType,
                 &msg,sizeof msg,CSPluginAPI::CSPluginName) || !msg.GetApiFunction){
-            logger::error("Open Shaders revision-4 wind API unavailable");return;
+            WIND_LOG_ERROR("Open Shaders revision-4 wind API unavailable");return;
         }
         auto* iface=static_cast<CSPluginAPI::ICSInterface001*>(msg.GetApiFunction(4));
         if(!iface || iface->getBuildNumber()!=9){
-            logger::error("Open Shaders API revision/build mismatch");return;
+            WIND_LOG_ERROR("Open Shaders API revision/build mismatch");return;
         }
         wind_.store(iface,std::memory_order_release);
-        logger::info("Open Shaders rev4 wind connected; IncludeNativeHavokImpulses={}",g_settings.includeNative);
+        WIND_LOG_INFO("Open Shaders rev4 wind connected; IncludeNativeHavokImpulses={}",g_settings.includeNative);
     }
     void Shutdown(){
         wind_.store(nullptr,std::memory_order_release);
@@ -354,7 +366,7 @@ public:
     void OnPreLoadGame(){
         sessionPaused_.store(true,std::memory_order_release);
         sceneEpoch_.fetch_add(1,std::memory_order_acq_rel);
-        logger::info("Save transition: suspending wind; waiting for active PreStep");
+        WIND_LOG_INFO("Save transition: suspending wind; waiting for active PreStep");
         {
             std::lock_guard stepLock(stepMutex_);
             {
@@ -366,13 +378,13 @@ public:
             ResetRuntimeState();
             osfsmp::RequestSceneCacheReset();
         }
-        logger::info("Save transition: old-save state released before teardown");
+        WIND_LOG_INFO("Save transition: old-save state released before teardown");
     }
     void OnPostLoadGame(){
         // PreLoad has already cleared old-save cached references. Resume only
         // once Skyrim signals post-load; never try to release them after load.
         sessionPaused_.store(false,std::memory_order_release);
-        logger::info("Save transition: wind resumes with fresh systems on next PreStep");
+        WIND_LOG_INFO("Save transition: wind resumes with fresh systems on next PreStep");
     }
     void OnNewGame(){
         OnPreLoadGame();
@@ -436,7 +448,7 @@ public:
                 // the old, actor-only constraint graph heuristic.
                 meta_.clear();index_.clear();systems_.clear();ignoredBodies_.clear();
                 if(frames_%120==0)
-                    logger::error("Failed FSMP m_systems snapshot; wind skipped (see stage above)");
+                    WIND_LOG_ERROR("Failed FSMP m_systems snapshot; wind skipped (see stage above)");
                 ++frames_;
                 return RE::BSEventNotifyControl::kContinue;
             }
@@ -455,7 +467,7 @@ public:
             g.selfTransientExposure=std::lerp(g.selfTransientExposure,g.selfTransientTarget,t);
         }
         ++frames_;
-        const bool logBoneForceStep = g_settings.logBoneForces &&
+        const bool logBoneForceStep = g_settings.enableLogging && g_settings.logBoneForces &&
             frames_ % static_cast<std::uint64_t>(g_settings.boneForceLogEvery) == 0;
         SampleShelterPointWinds(shaders);
         QueueSceneWork(dirty,shaders);
@@ -557,7 +569,7 @@ public:
             }
         }
         if (logBoneForceStep) LogBoneForces(boneForceDiagnostics);
-        if(g_settings.logEvery>0 && frames_%g_settings.logEvery==0)LogSummary();
+        if(g_settings.enableLogging && g_settings.logEvery>0 && frames_%g_settings.logEvery==0)LogSummary();
         return RE::BSEventNotifyControl::kContinue;
     }
 private:
@@ -587,7 +599,7 @@ private:
         geometryDirty_=true;
         rootlessWarningIssued_=false;
         lastRootlessWarningFrame_=0;
-        logger::info("Save transition: cleared cached FSMP bodies/systems/shelter and area bindings");
+        WIND_LOG_INFO("Save transition: cleared cached FSMP bodies/systems/shelter and area bindings");
     }
     static osfsmp::Vec3 ToVec(const CSPluginAPI::WindVector& v){return {v.x,v.y,v.z};}
     // Called at rebuilds and periodically to capture movement/rotation of large
@@ -739,13 +751,13 @@ private:
             std::lock_guard lock(resultLock_);
             std::swap(result,completed_);
         }
-        if(g_settings.logAreaDiagnostics){
+        if(g_settings.enableLogging && g_settings.logAreaDiagnostics){
             for(const auto& d:result.areaDiagnostics){
                 if(d.measuredBodies || !d.bodyCount || d.fromCache) continue;
                 // At most one missing-area diagnosis per system per loaded
                 // save. Re-equip creates a new system and gets its own entry.
                 if(!areaDiagnosticLogged_.insert(d.system).second)continue;
-                logger::warn("[AreaScan] sys=0x{:X} ref={:08X} bones={} measured={} geom={} skinned={} rootScoped={} exactSkin={} nameOnlySkin={} partitionExact={} partitionReadable={} triangles={} reason={}",
+                WIND_LOG_WARN("[AreaScan] sys=0x{:X} ref={:08X} bones={} measured={} geom={} skinned={} rootScoped={} exactSkin={} nameOnlySkin={} partitionExact={} partitionReadable={} triangles={} reason={}",
                     d.system,d.referenceFormID,d.bodyCount,d.measuredBodies,
                     d.geometryMeshes,d.skinnedMeshes,d.rootScopedMeshes,
                     d.exactSkinMeshes,d.nameOnlySkinMeshes,d.exactPartitions,
@@ -996,14 +1008,14 @@ private:
             // Log diagnostic detail on a throttled interval, without ever
             // continuing from a structurally invalid private ABI snapshot.
             if(frames_%120==0)
-                logger::error("FSMP snapshot failure stage='{}' systems={} matched={} candidates={} suspect=0x{:X}",
+                WIND_LOG_ERROR("FSMP snapshot failure stage='{}' systems={} matched={} candidates={} suspect=0x{:X}",
                     snapshot.stage,snapshot.systems,snapshot.registered,
                     snapshot.candidates,snapshot.suspect);
             return false;
         }
         if (snapshot.rootlessSystems &&
             (!rootlessWarningIssued_ || frames_ - lastRootlessWarningFrame_ >= 1800)) {
-            logger::warn("FSMP skipped {} system(s) with null m_skeleton (first=0x{:X}); other verified systems remain active; skipped systems receive NO wind",
+            WIND_LOG_WARN("FSMP skipped {} system(s) with null m_skeleton (first=0x{:X}); other verified systems remain active; skipped systems receive NO wind",
                 snapshot.rootlessSystems, snapshot.firstRootless);
             rootlessWarningIssued_ = true;
             lastRootlessWarningFrame_ = frames_;
@@ -1063,7 +1075,7 @@ private:
             if(!index_.contains(b)) ignoredBodies_.insert(b);
         }
         if(!ignoredBodies_.empty() && frames_%240==0)
-            logger::warn("FSMP PreStep contained {} non-authoritative bodies ({} unmatched systems, {} invalid bone metadata); safely ignored",
+            WIND_LOG_WARN("FSMP PreStep contained {} non-authoritative bodies ({} unmatched systems, {} invalid bone metadata); safely ignored",
                 ignoredBodies_.size(),snapshot.unmatched,
                 ignoredBodies_.size()>snapshot.unmatched ? ignoredBodies_.size()-snapshot.unmatched : 0);
         // Constraints are used only for approximate segment axes/lengths.
@@ -1117,7 +1129,7 @@ private:
             const auto direction=m.segmentLength>1.e-6f?segment/m.segmentLength:btVector3{0,0,-1};
             m.localAxis=V(tf.getBasis().transpose()*direction);
         }
-        logger::info("FSMP authoritative systems={}, registered bones={}, kinematic anchors={}, skippedRootless={}",
+        WIND_LOG_INFO("FSMP authoritative systems={}, registered bones={}, kinematic anchors={}, skippedRootless={}",
             systems_.size(),meta_.size(),std::count_if(systems_.begin(),systems_.end(),
                 [](const auto& pair){return pair.second.anchorIsKinematic;}),
             snapshot.rootlessSystems);
@@ -1142,11 +1154,11 @@ private:
         });
         const std::size_t limit=g_settings.boneForceLogMaxEntries==0?rows.size():
             std::min(rows.size(),static_cast<std::size_t>(g_settings.boneForceLogMaxEntries));
-        logger::info("[BoneForce] frame={} evaluated={} requestedNonzero={} accumulatedNonzero={} suppressed={} showing={} (of {}), highest accumulated first",
+        WIND_LOG_INFO("[BoneForce] frame={} evaluated={} requestedNonzero={} accumulatedNonzero={} suppressed={} showing={} (of {}), highest accumulated first",
             frames_,rows.size(),nonzeroRequested,nonzeroAccepted,blocked,limit,rows.size());
         for(std::size_t i=0;i<limit;++i){
             const auto& r=rows[i];
-            logger::info("[BoneForce] #{} ref={:08X} world={} sys=0x{:X} body=0x{:X} bone='{}' windSpeed={:.3f} area={:.2f} mass={:.3f} windFactor={:.3f} shelter=({:.2f},{:.2f}) self=({:.2f},{:.2f}) skeletonAxis={} areaFallback={} requested=({:.3f},{:.3f},{:.3f}) |F|={:.3f} added=({:.3f},{:.3f},{:.3f}) |dF|={:.3f} linearFactor=({:.2f},{:.2f},{:.2f}) totalBefore=({:.3f},{:.3f},{:.3f}) totalAfter=({:.3f},{:.3f},{:.3f})",
+            WIND_LOG_INFO("[BoneForce] #{} ref={:08X} world={} sys=0x{:X} body=0x{:X} bone='{}' windSpeed={:.3f} area={:.2f} mass={:.3f} windFactor={:.3f} shelter=({:.2f},{:.2f}) self=({:.2f},{:.2f}) skeletonAxis={} areaFallback={} requested=({:.3f},{:.3f},{:.3f}) |F|={:.3f} added=({:.3f},{:.3f},{:.3f}) |dF|={:.3f} linearFactor=({:.2f},{:.2f},{:.2f}) totalBefore=({:.3f},{:.3f},{:.3f}) totalAfter=({:.3f},{:.3f},{:.3f})",
                 i+1,r.reference,r.worldObject,r.system,r.body,r.name,
                 osfsmp::Length(r.wind),r.area,r.mass,r.boneFactor,
                 r.ambientExposure,r.transientExposure,
@@ -1175,7 +1187,7 @@ private:
             if(m.matched&&(m.areaMeasured||g_settings.allowFallback||
                (g_settings.allowWorldFallback&&m.worldObject)))++ready;
         }
-        logger::info("Frame {}: systems={} bodies={} nodeMatched={} worldBodies={} NIFarea={} areaReady={} shelterProbeBatches={} sceneTasks={} windSamples={} maxBase={:.3f} nonzeroForces={} maxForce={:.3f} shelterPoints={} multiProbeSystems={} selfProbeBatches={} skeletonAxes={} fallbackAreas={}",
+        WIND_LOG_INFO("Frame {}: systems={} bodies={} nodeMatched={} worldBodies={} NIFarea={} areaReady={} shelterProbeBatches={} sceneTasks={} windSamples={} maxBase={:.3f} nonzeroForces={} maxForce={:.3f} shelterPoints={} multiProbeSystems={} selfProbeBatches={} skeletonAxes={} fallbackAreas={}",
             frames_,systems_.size(),meta_.size(),connected,world,measured,ready,
             probeBatches_,sceneScans_.load(std::memory_order_relaxed),sampledThisStep_,
             maxBaseResponse_,appliedThisStep_,maxAppliedForce_,shelterPoints,multiProbeSystems,
@@ -1226,7 +1238,7 @@ void OnMessage(SKSE::MessagingInterface::Message* msg){
             if(msg->data)
                 g_adapter.SetFSMP(static_cast<hdt::PluginInterface*>(msg->data));
             else
-                logger::error("FSMP MSG_STARTUP received with a null PluginInterface; wind integration unavailable");
+                WIND_LOG_ERROR("FSMP MSG_STARTUP received with a null PluginInterface; wind integration unavailable");
         }
         return;
     }
@@ -1243,12 +1255,12 @@ void OnMessage(SKSE::MessagingInterface::Message* msg){
             break;
         case SKSE::MessagingInterface::kPostLoad:
             if(!SKSE::GetMessagingInterface()->RegisterListener("hdtsmp64",OnMessage))
-                logger::error("Could not subscribe to FSMP startup message");
+                WIND_LOG_ERROR("Could not subscribe to FSMP startup message");
             break;
         case SKSE::MessagingInterface::kDataLoaded:
             if(!g_fsmpStartupSeen.load(std::memory_order_acquire) &&
                !g_fsmpMissingStartupWarned.exchange(true,std::memory_order_acq_rel)){
-                logger::warn("FSMP MSG_STARTUP not received by SKSE DataLoaded; wind integration unavailable. Check hdtsmp64.dll loading and FSMP startup logs");
+                WIND_LOG_WARN("FSMP MSG_STARTUP not received by SKSE DataLoaded; wind integration unavailable. Check hdtsmp64.dll loading and FSMP startup logs");
             }
             g_adapter.ConnectShaders();
             break;
@@ -1258,19 +1270,21 @@ void OnMessage(SKSE::MessagingInterface::Message* msg){
 } // namespace
 
 SKSEPluginLoad(const SKSE::LoadInterface* skse){
-    SKSE::Init(skse,{.logName="OpenShadersFSMPWind"});
+    // Read the INI before SKSE::Init: CommonLib emits its own startup banner
+    // during logger initialization. Passing .log=false suppresses that too.
     LoadSettings();
+    SKSE::Init(skse,{.log=g_settings.enableLogging,.logName="OpenShadersFSMPWind"});
     const auto* messaging=SKSE::GetMessagingInterface();
     if(!messaging||!messaging->RegisterListener(OnMessage))return false;
-    logger::info("OpenShadersFSMPWind 0.3.4 loaded, Skyrim 1.7.104 target; matched NIF skin areas + world shielding");
-    logger::info("Bone force diagnostics: enabled={}, interval={} physics steps, max entries={} (0=all)",
+    WIND_LOG_INFO("OpenShadersFSMPWind 0.3.4 loaded, Skyrim 1.7.104 target; matched NIF skin areas + world shielding");
+    WIND_LOG_INFO("Bone force diagnostics: enabled={}, interval={} physics steps, max entries={} (0=all)",
         g_settings.logBoneForces,g_settings.boneForceLogEvery,g_settings.boneForceLogMaxEntries);
-    logger::info("Wind: strength={}, cap={}, maxAcceleration={}, nativeTaggedTransients={}, shelter={}, allowFallback={}",
+    WIND_LOG_INFO("Wind: strength={}, cap={}, maxAcceleration={}, nativeTaggedTransients={}, shelter={}, allowFallback={}",
         g_settings.strength,g_settings.maxSpeed,g_settings.maxWindAcceleration,g_settings.includeNative,
         g_settings.enableShelter,g_settings.allowFallback);
-    logger::info("Self-shelter: enabled={}, reach={} Skyrim units; game-thread actor Havok + posed head/shoulder approximations; unavailable probes unobstructed; missing-area fallback={}",
+    WIND_LOG_INFO("Self-shelter: enabled={}, reach={} Skyrim units; game-thread actor Havok + posed head/shoulder approximations; unavailable probes unobstructed; missing-area fallback={}",
         g_settings.enableSelfShelter,g_settings.selfShelterReach,g_settings.allowFallback);
-    logger::info("Shelter: 1/3/5 points (extent thresholds {} / {} Skyrim units); distance ramp {}..{}; cadence {}s; unavailable probes unobstructed",
+    WIND_LOG_INFO("Shelter: 1/3/5 points (extent thresholds {} / {} Skyrim units); distance ramp {}..{}; cadence {}s; unavailable probes unobstructed",
         g_settings.shelterThreePointDistance,g_settings.shelterFivePointDistance,
         g_settings.shelterNoWindDistance,g_settings.shelterMaxWindDistance,g_settings.shelterInterval);
     return true;

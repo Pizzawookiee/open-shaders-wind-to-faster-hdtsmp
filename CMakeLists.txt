@@ -4,25 +4,9 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Save-switch source overlay: apply the guarded v0.3.4 fix on configure.
-# This makes the ZIP usable as an overwrite package without a manual copy of
-# a 1200-line translation unit. The script preserves a .pre-savefix backup,
-# is idempotent, and refuses to edit unexpected source versions.
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/apply-save-switch-fix.py")
-    find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    execute_process(
-        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/apply-save-switch-fix.py"
-                --source "${CMAKE_CURRENT_SOURCE_DIR}/src/Plugin.cpp"
-        RESULT_VARIABLE OSFSMPWIND_PATCH_RESULT
-        OUTPUT_VARIABLE OSFSMPWIND_PATCH_OUTPUT
-        ERROR_VARIABLE OSFSMPWIND_PATCH_ERROR
-    )
-    if(NOT OSFSMPWIND_PATCH_RESULT EQUAL 0)
-        message(FATAL_ERROR "Save-switch source patch failed:\n${OSFSMPWIND_PATCH_ERROR}")
-    endif()
-    string(STRIP "${OSFSMPWIND_PATCH_OUTPUT}" OSFSMPWIND_PATCH_OUTPUT)
-    message(STATUS "${OSFSMPWIND_PATCH_OUTPUT}")
-endif()
+# The save-switch fix is included directly in src/Plugin.cpp.
+# Do not invoke older configure-time Python patchers: this project
+# now builds the checked-in source without rewriting it.
 
 # An existing installation is FIRST-CLASS. CMake never rewrites that source tree.
 set(CommonLibSSEPath_NG "" CACHE PATH "Existing CommonLibSSE-NG source checkout")
