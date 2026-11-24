@@ -7,6 +7,7 @@
 #include "SelfShelter.h"
 #include "OpenShaders/CSinterface001.h"
 #include <RE/Skyrim.h>
+#include <Windows.h>  // Guard reads from incomplete/detaching skin instances.
 #include <algorithm>
 #include <atomic>
 #include <array>
@@ -19,6 +20,7 @@
 #include <numbers>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -39,6 +41,59 @@ std::atomic_bool g_cacheResetRequested{false};
 void HashMix(std::uint64_t& seed, std::uint64_t value) noexcept {
     seed ^= value + 0x9e3779b97f4a7c15ull + (seed<<6) + (seed>>2);
 }
+
+// Skin instances can be incomplete while actors are attaching/detaching.
+// Keep SEH in leaf helpers with no C++ objects requiring stack unwinding.
+// A failed snapshot is never used to attribute NIF area to an FSMP bone.
+bool TryGetSkinBoneCount(const RE::NiSkinInstance* skin, std::uint32_t& count) noexcept {
+    count=0;
+    __try {
+        if(!skin || !skin->skinData.get() || !skin->bones)return false;
+        count=skin->skinData->GetBoneCount();
+        return count>0 && count<=4096;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        count=0;
+        return false;
+    }
+}
+bool TryCopySkinBones(const RE::NiSkinInstance* skin,
+    RE::NiAVObject** destination, std::uint32_t count) noexcept
+{
+    __try {
+        if(!skin || !skin->bones || !destination || count==0 || count>4096)return false;
+        std::memcpy(destination,skin->bones,static_cast<std::size_t>(count)*sizeof(*destination));
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+bool SnapshotSkinBones(const RE::NiSkinInstance* skin,
+    std::vector<RE::NiAVObject*>& bones)
+{
+    std::uint32_t count{};
+    if(!TryGetSkinBoneCount(skin,count))return false;
+    bones.resize(count);
+    if(TryCopySkinBones(skin,bones.data(),count))return true;
+    bones.clear();
+    return false;
+}
+
+// Preserve authoritative bone name verification without constructing an
+// unbounded std::string from a potentially invalid BSFixedString pointer.
+// The diagnostic-only path no longer reads unrelated skin bone names at all.
+bool SafeNodeNameEquals(const RE::NiAVObject* node, std::string_view expected) noexcept {
+    if(!node || expected.empty() || expected.size()>191)return false;
+    __try {
+        const char* text=node->name.c_str();
+        if(!text || reinterpret_cast<std::uintptr_t>(text)<0x10000)return false;
+        for(std::size_t i=0;i<expected.size();++i){
+            if(text[i]!=expected[i])return false;
+        }
+        return text[expected.size()]=='\0';
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
 std::uint64_t AreaFingerprint(RE::NiAVObject* root,
     const std::unordered_map<std::string,std::size_t>& names, std::span<const BodyRequest> bodies)
 {
@@ -52,6 +107,8 @@ std::uint64_t AreaFingerprint(RE::NiAVObject* root,
         // Same name/body with a different validated NiNode must miss the cache.
         HashMix(hash,reinterpret_cast<std::uintptr_t>(bodies[index].boneNode.get()));
     }
+    // Reuse one snapshot buffer across geometries to avoid per-mesh allocations.
+    std::vector<RE::NiAVObject*> skinBones;
     RE::BSVisit::TraverseScenegraphGeometries(root,[&](RE::BSGeometry* geometry){
         HashMix(hash,reinterpret_cast<std::uintptr_t>(geometry));
         if(geometry){
@@ -59,14 +116,11 @@ std::uint64_t AreaFingerprint(RE::NiAVObject* root,
             HashMix(hash,reinterpret_cast<std::uintptr_t>(skin));
             // Skin bindings may change without replacing the geometry or partition.
             // Exact NiNode identity is authoritative for area attribution.
-            const auto* data=skin?skin->skinData.get():nullptr;
-            if (skin && skin->bones && data) {
-                const auto count=data->GetBoneCount();
-                if (count<=4096) {
-                    HashMix(hash,count);
-                    for (std::uint32_t i=0;i<count;++i)
-                        HashMix(hash,reinterpret_cast<std::uintptr_t>(skin->bones[i]));
-                }
+            skinBones.clear();
+            if(SnapshotSkinBones(skin,skinBones)){
+                HashMix(hash,skinBones.size());
+                for(const auto* bone:skinBones)
+                    HashMix(hash,reinterpret_cast<std::uintptr_t>(bone));
             }
             const auto* parts=skin?skin->skinPartition.get():nullptr;
             HashMix(hash,reinterpret_cast<std::uintptr_t>(parts));
@@ -276,45 +330,32 @@ SelfShelterBinding ProbeSelfShelter(const SelfShelterRequest& request,float reac
 // A matching name on an unrelated accessory/skin is not sufficient attribution.
 void CollectSkinAreas(RE::NiAVObject* root, RE::NiAVObject* systemRoot,
     const std::unordered_map<const RE::NiAVObject*,std::size_t>& nodeToBody,
-    const std::unordered_map<std::string,std::size_t>& names,
     std::span<float> areas,AreaScanDiagnostic& stats)
 {
-    if(!root || nodeToBody.empty()) return;
-    // Diagnostics only: FSMP often prefixes dynamically renamed head bones,
-    // while the original hair-card skin can retain its unprefixed name.
-    // This does NOT authorize area attribution; exact node identity remains
-    // required to prevent cross-wig and cross-outfit contamination.
-    std::unordered_set<std::string> diagnosticAliases;
-    for(const auto& [name,index]:names){
-        (void)index;
-        diagnosticAliases.insert(name);
-        if(name.starts_with("hdtSSEPhysics_AutoRename_")){
-            const auto boundary=name.find(' ');
-            if(boundary!=std::string::npos && boundary+1<name.size())
-                diagnosticAliases.insert(name.substr(boundary+1));
-        }
-    }
+    if(!root || nodeToBody.empty())return;
+    // No diagnostic bone-name comparisons. Only validated NiNode pointer
+    // identity may associate skinned geometry with this FSMP system.
+    std::vector<RE::NiAVObject*> skinBones;
     RE::BSVisit::TraverseScenegraphGeometries(root,[&](RE::BSGeometry* geometry){
         if(!geometry) return RE::BSVisit::BSVisitControl::kContinue;
         ++stats.geometryMeshes;
         if(systemRoot && HasAncestor(geometry,systemRoot))++stats.rootScopedMeshes;
         auto* skin=geometry->GetGeometryRuntimeData().skinInstance.get();
-        if(!skin || !skin->bones || !skin->skinData)
+        skinBones.clear();
+        if(!SnapshotSkinBones(skin,skinBones))
             return RE::BSVisit::BSVisitControl::kContinue;
         ++stats.skinnedMeshes;
-        const auto boneCount=skin->skinData->GetBoneCount();
-        if(boneCount==0 || boneCount>4096) return RE::BSVisit::BSVisitControl::kContinue;
-        // Skip unrelated meshes early. Render-tree location and shared bone
-        // names alone cannot associate skin geometry with an FSMP system.
-        bool belongsToSystem=false, nameOnlyMatch=false;
-        for(std::uint32_t i=0;i<boneCount;++i){
-            auto* boneNode=skin->bones[i];
-            if(!boneNode)continue;
-            if(nodeToBody.contains(boneNode)) belongsToSystem=true;
-            else if(diagnosticAliases.contains(std::string(boneNode->name.c_str()))) nameOnlyMatch=true;
+        const auto boneCount=static_cast<std::uint32_t>(skinBones.size());
+        // Do not dereference unrelated skin nodes (or their names). A snapshot
+        // might include invalid pointers while an NPC is being attached.
+        bool belongsToSystem=false;
+        for(const auto* boneNode:skinBones){
+            if(boneNode && nodeToBody.contains(boneNode)){
+                belongsToSystem=true;
+                break;
+            }
         }
         if(belongsToSystem)++stats.exactSkinMeshes;
-        else if(nameOnlyMatch)++stats.nameOnlySkinMeshes;
         if(!belongsToSystem)return RE::BSVisit::BSVisitControl::kContinue;
         auto* parts=skin->skinPartition.get();
         if(!parts || parts->numPartitions>1024)
@@ -327,8 +368,8 @@ void CollectSkinAreas(RE::NiAVObject* root, RE::NiAVObject* systemRoot,
             bool partitionHasSystemBone=false;
             for(std::uint32_t palette=0;palette<part.numBones;++palette){
                 const auto skinBone=part.bones[palette];
-                if(skinBone<boneCount && skin->bones[skinBone] &&
-                   nodeToBody.contains(skin->bones[skinBone])){
+                if(skinBone<boneCount && skinBones[skinBone] &&
+                   nodeToBody.contains(skinBones[skinBone])){
                     partitionHasSystemBone=true;
                     break;
                 }
@@ -359,10 +400,10 @@ void CollectSkinAreas(RE::NiAVObject* root, RE::NiAVObject* systemRoot,
                     const auto palette=block[8+slot];
                     if(palette>=part.numBones)continue;
                     const auto skinBone=part.bones[palette];
-                    if(skinBone>=boneCount || !skin->bones[skinBone])continue;
+                    if(skinBone>=boneCount || !skinBones[skinBone])continue;
                     // Exact node identity prevents unrelated geometry that happens
                     // to use the same bone name from contributing surface area.
-                    const auto it=nodeToBody.find(skin->bones[skinBone]);
+                    const auto it=nodeToBody.find(skinBones[skinBone]);
                     if(it==nodeToBody.end())continue;
                     vertices[v].rigBone[slot]=static_cast<int>(it->second);
                 }
@@ -423,7 +464,7 @@ SceneResult ScanScene(std::span<const BodyRequest> bodies,
             const auto& b=bodies[index];
             auto* boneNode=b.boneNode.get();
             if(!boneNode || b.name.empty() || !HasAncestor(boneNode,root) ||
-               std::string_view(boneNode->name.c_str())!=b.name)continue;
+               !SafeNodeNameEquals(boneNode,b.name))continue;
             const float distance=Length(ToVec(boneNode->world.translate)-b.worldOrigin);
             if(!std::isfinite(distance)||distance>settings.maximumBodyNodeDistance)continue;
             if(duplicates.contains(b.name))continue;
@@ -513,7 +554,7 @@ SceneResult ScanScene(std::span<const BodyRequest> bodies,
                 if(it!=found->second.byBody.end())measured[idx]=it->second;
             }
         } else {
-            CollectSkinAreas(geometryRoot,root,byNode,byName,measured,stats);
+            CollectSkinAreas(geometryRoot,root,byNode,measured,stats);
             AreaCache cache;
             cache.root=reinterpret_cast<std::uintptr_t>(geometryRoot);
             cache.fingerprint=fingerprint;
