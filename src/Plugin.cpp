@@ -34,6 +34,8 @@
 #include "WindScene.h"
 #include "WindShelter.h"
 #include "FSMPWorldABI.h"
+#include "GuardedWindCall.h"
+#include "GeometryWake.h"
 
 namespace logger=SKSE::log;
 using namespace std::literals;
@@ -56,7 +58,7 @@ struct Settings {
     bool enableSelfShelter{true};
     float selfShelterReach{150.f};
     float maxBoneNodeDistance{180.f};
-    float geometryScanSeconds{3.0f};
+    float geometryScanSeconds{10.0f};
     float shelterInterval{0.5f};
     float shelterNoWindDistance{50.f};
     float shelterMaxWindDistance{2000.f};
@@ -111,7 +113,7 @@ void LoadSettings(){
     g_settings.enableSelfShelter=ReadInt("EnableSelfShelter",1)!=0;
     g_settings.selfShelterReach=ReadFloat("SelfShelterReach",150.f,20.f,500.f);
     g_settings.maxBoneNodeDistance=ReadFloat("MaxBoneNodeDistance",180.f,25.f,600.f);
-    g_settings.geometryScanSeconds=ReadFloat("GeometryRescanSeconds",3.0f,0.5f,30.0f);
+    g_settings.geometryScanSeconds=ReadFloat("GeometryRescanSeconds",10.0f,0.5f,30.0f);
     g_settings.shelterInterval=ReadFloat("ShelterIntervalSeconds",0.5f,0.1f,2.0f);
     g_settings.shelterNoWindDistance=ReadFloat("ShelterNoWindDistance",50.f,0.f,1000.f);
     g_settings.shelterMaxWindDistance=ReadFloat("ShelterMaxWindDistance",2000.f,100.f,3000.f);
@@ -290,6 +292,8 @@ struct ShelterPointState {
 };
 struct SystemMetadata {
     std::uintptr_t identity{};
+    // Last validated reference, for scheduling only; never authorizes a bone.
+    RE::FormID geometryReference{};
     RE::NiPointer<RE::NiNode> root;
     btRigidBody* anchor{};
     bool anchorIsKinematic{};
@@ -346,7 +350,7 @@ public:
         WIND_LOG_INFO("FSMP system-level private ABI ready; subscribed to PreStep");
     }
     void ConnectShaders(){
-        if(!g_settings.enabled)return;
+        if(!g_settings.enabled || windFaulted_.load(std::memory_order_acquire))return;
         if(IsCommunityShadersExpanded()){
             WIND_LOG_ERROR("Detected incompatible Community Shaders Expanded; wind disabled");return;
         }
@@ -415,6 +419,15 @@ public:
             WIND_LOG_INFO("Scene transition: loading menu closed, warmupSteps={}",warmupSteps_);
         }
     }
+    // Event callbacks enqueue numeric IDs only. Never acquire stepMutex_ here:
+    // equip/load notifications can run while FSMP or the game holds other locks.
+    void OnGeometryChanged(RE::FormID reference){
+        if(!g_settings.enabled || !reference || sessionPaused_.load(std::memory_order_acquire))return;
+        std::lock_guard lock(geometryEventMutex_);
+        if(sessionPaused_.load(std::memory_order_acquire))return;
+        geometryEvents_.insert(reference);
+        geometryEventsPending_.store(true,std::memory_order_release);
+    }
     void OnReferenceDetaching(RE::FormID reference){
         if(!g_settings.resetOnReferenceDetach || !reference ||
            sessionPaused_.load(std::memory_order_acquire))return;
@@ -462,6 +475,7 @@ public:
         if(!shaders)return RE::BSEventNotifyControl::kContinue;
         const float dt=std::isfinite(event->timeStep)?std::clamp(event->timeStep,0.f,0.1f):0.f;
         clock_+=dt;
+        AdvanceGeometryEvents(dt);
         if(clock_>86400.f) { // Prevent unbounded float precision loss after long sessions.
             clock_-=43200.f;
             nextGeometryScanAt_-=43200.f;
@@ -496,11 +510,13 @@ public:
                 }
             }
         }
+        if(dirty)geometryDirty_=true;
         if(dirty || frames_%240==0){
             if(!Rebuild(candidates)){
                 // Inconsistent system ownership is unsafe; do not fall back to
                 // the old, actor-only constraint graph heuristic.
                 meta_.clear();index_.clear();systems_.clear();ignoredBodies_.clear();
+                geometryDirty_=true;
                 if(frames_%120==0)
                     WIND_LOG_ERROR("Failed FSMP m_systems snapshot; wind skipped (see stage above)");
                 ++frames_;
@@ -508,7 +524,6 @@ public:
             }
             dirty=true;
         }
-        if(dirty)geometryDirty_=true;
         ConsumeCompleted();
         UpdateShelterPointLayouts(dirty);
         for(auto& [id,g]:systems_){
@@ -524,7 +539,8 @@ public:
         const bool logBoneForceStep = g_settings.enableLogging && g_settings.logBoneForces &&
             frames_ % static_cast<std::uint64_t>(g_settings.boneForceLogEvery) == 0;
         SampleShelterPointWinds(shaders);
-        QueueSceneWork(dirty,shaders);
+        if(windFaulted_.load(std::memory_order_acquire))return RE::BSEventNotifyControl::kContinue;
+        QueueSceneWork();
 
         // Aerodynamic force is still evaluated at every bone. Shelter exposure
         // is interpolated from the system's independently sampled points.
@@ -550,7 +566,7 @@ public:
         for(std::size_t off=0;off<indices.size();off+=batch){
             const auto n=std::min<std::size_t>(batch,indices.size()-off);
             std::vector<CSPluginAPI::WindSampleWithHavokExclusion> samples(n);
-            if(!shaders->SampleWindExcludingHavokImpulses(positions.data()+off,samples.data(),
+            if(!SampleWindSafe(shaders,positions.data()+off,samples.data(),
                     static_cast<std::uint32_t>(n)))continue;
             sampledThisStep_+=n;
             for(std::size_t j=0;j<n;++j){
@@ -640,6 +656,12 @@ private:
         meta_.clear();
         systems_.clear();
         areaDiagnosticLogged_.clear();
+        geometryWake_.clear();
+        {
+            std::lock_guard lock(geometryEventMutex_);
+            geometryEvents_.clear();
+            geometryEventsPending_.store(false,std::memory_order_release);
+        }
         scanPending_.store(false,std::memory_order_release);
         activeScanTicket_.store(0,std::memory_order_release);
         frames_=0;
@@ -654,6 +676,30 @@ private:
         rootlessWarningIssued_=false;
         lastRootlessWarningFrame_=0;
         WIND_LOG_INFO("Save transition: cleared cached FSMP bodies/systems/shelter and area bindings");
+    }
+    bool SampleWindSafe(CSPluginAPI::ICSInterface001* api,
+        const CSPluginAPI::WindVector* positions,
+        CSPluginAPI::WindSampleWithHavokExclusion* samples,std::uint32_t count){
+        if(windFaulted_.load(std::memory_order_acquire))return false;
+        bool faulted=false;
+        const bool ok=osfsmp::GuardedWindSample(api,positions,samples,count,faulted);
+        if(faulted){
+            windFaulted_.store(true,std::memory_order_release);
+            wind_.store(nullptr,std::memory_order_release);
+            WIND_LOG_ERROR("Open Shaders wind API faulted; wind disabled until game restart (no weather fallback)");
+        }
+        return ok;
+    }
+    void AdvanceGeometryEvents(float dt){
+        geometryWake_.advance(dt);
+        if(!geometryEventsPending_.load(std::memory_order_acquire))return;
+        std::unordered_set<RE::FormID> events;
+        {
+            std::lock_guard lock(geometryEventMutex_);
+            events.swap(geometryEvents_);
+            geometryEventsPending_.store(false,std::memory_order_release);
+        }
+        for(const auto reference:events)geometryWake_.note(reference);
     }
     static osfsmp::Vec3 ToVec(const CSPluginAPI::WindVector& v){return {v.x,v.y,v.z};}
     // Called at rebuilds and periodically to capture movement/rotation of large
@@ -756,7 +802,7 @@ private:
         for(std::size_t off=0;off<positions.size();off+=batch){
             const auto n=std::min<std::size_t>(batch,positions.size()-off);
             std::vector<CSPluginAPI::WindSampleWithHavokExclusion> samples(n);
-            if(!shaders->SampleWindExcludingHavokImpulses(positions.data()+off,samples.data(),
+            if(!SampleWindSafe(shaders,positions.data()+off,samples.data(),
                     static_cast<std::uint32_t>(n)))continue;
             for(std::size_t j=0;j<n;++j){
                 const auto key=ids[off+j];
@@ -844,6 +890,7 @@ private:
             m.measuredArea=r.measuredArea;
             m.worldObject=r.allowWorldFallback;
             m.reference=r.referenceFormID;
+            if(r.nodeMatched && r.referenceFormID)group->second.geometryReference=r.referenceFormID;
         }
         for(const auto& r:result.shelters){
             const auto it=systems_.find(r.system);
@@ -886,25 +933,31 @@ private:
             }
         }
     }
-    bool QueueSceneWork(bool dirty,CSPluginAPI::ICSInterface001*){
+    bool QueueSceneWork(){
         const auto epoch=sceneEpoch_.load(std::memory_order_acquire);
         if(sessionPaused_.load(std::memory_order_acquire))return false;
         if(scanPending_.load(std::memory_order_acquire))return false;
         auto* tasks=SKSE::GetTaskInterface();
         if(!tasks)return false;
-        if(dirty)geometryDirty_=true;
         const bool scanGeometry=geometryDirty_ || clock_>=nextGeometryScanAt_;
         std::vector<osfsmp::BodyRequest> bodies;
-        if(scanGeometry){
-            bodies.reserve(meta_.size());
+        std::unordered_set<RE::FormID> refreshedReferences;
+        if(scanGeometry || !geometryWake_.empty()){
+            if(scanGeometry)bodies.reserve(meta_.size());
             for(const auto& m:meta_){
                 if(!m.owner||m.name.empty())continue;
                 const auto it=systems_.find(m.system);
                 if(it==systems_.end() || !m.node || !it->second.root)continue;
+                const auto reference=it->second.geometryReference;
+                const bool eventDue=geometryWake_.due(reference);
+                if(!scanGeometry && !eventDue)continue;
+                // All bones of a selected system travel together, preserving
+                // the exact-node area attribution and system cache key.
                 const auto p=V(m.body->getWorldTransform().getOrigin());
                 bodies.push_back({reinterpret_cast<std::uintptr_t>(m.body),
                     reinterpret_cast<std::uintptr_t>(m.owner),m.system,m.name,p,
-                    m.segmentLength,it->second.root,m.node});
+                    m.segmentLength,it->second.root,m.node,eventDue});
+                if(eventDue)refreshedReferences.insert(reference);
             }
         }
         std::vector<osfsmp::ShelterRequest> probes;
@@ -978,6 +1031,7 @@ private:
         // Only one task at a time: avoid concurrently walking scene graphs or
         // mutating area caches; overdue probes remain eligible next PreStep.
         if(scanPending_.exchange(true,std::memory_order_acq_rel))return false;
+        for(const auto reference:refreshedReferences)geometryWake_.scanned(reference);
         probeBatches_+=probes.size();
         selfProbeBatches_+=selfProbes.size();
         for(const auto& request:selfProbes){
@@ -1095,10 +1149,12 @@ private:
             // Persistent shelter factor when the same system/anchor survives
             // a body-list refresh. New systems receive a staggered first probe.
             const auto it=oldGroups.find(system.identity);
-            if(it!=oldGroups.end() && it->second.root.get()==system.root &&
-               it->second.anchor==system.anchor){
+            const bool sameGroup=it!=oldGroups.end() && it->second.root.get()==system.root &&
+               it->second.anchor==system.anchor;
+            if(sameGroup){
                 group=std::move(it->second);
             } else {
+                geometryDirty_=true;
                 group.pointEpoch=++nextPointEpoch_;
                 group.nextAmbientAt=clock_+osfsmp::StaggerProbeOffset(
                     system.identity,g_settings.shelterInterval);
@@ -1115,7 +1171,8 @@ private:
                 m.refs=bone.body->getNumConstraintRefs();
                 if(!ReadOwner(bone.body,m.boneFactor,m.owner,&m.name)||m.owner!=bone.owner)continue;
                 const auto old=oldIndex.find(bone.body);
-                if(old!=oldIndex.end()){
+                bool reused=false;
+                if(sameGroup && old!=oldIndex.end()){
                     const auto& prev=oldMeta[old->second];
                     if(prev.owner==m.owner&&prev.name==m.name&&prev.system==m.system&&
                        prev.node.get()==m.node.get()){
@@ -1124,11 +1181,14 @@ private:
                         if(m.axisFromSkeleton){m.localAxis=prev.localAxis;m.segmentLength=prev.segmentLength;}
                         m.measuredArea=prev.measuredArea;m.worldObject=prev.worldObject;
                         m.reference=prev.reference;
+                        reused=true;
                     }
                 }
+                if(!reused)geometryDirty_=true;
                 index_[bone.body]=meta_.size();meta_.push_back(std::move(m));
             }
         }
+        if(oldMeta.size()!=meta_.size() || oldGroups.size()!=systems_.size())geometryDirty_=true;
         // Unmatched/invalid candidates are never touched by wind code.
         // Each retained body is still identified by its authoritative system,
         // exact SkinnedMeshBone owner, and matching NIF bone node.
@@ -1261,6 +1321,11 @@ private:
     std::optional<PendingSceneWork> pendingScene_;
     hdt::PluginInterface* smp_{};
     std::atomic<CSPluginAPI::ICSInterface001*> wind_{nullptr};
+    std::atomic_bool windFaulted_{false};
+    std::mutex geometryEventMutex_;
+    std::unordered_set<RE::FormID> geometryEvents_;
+    std::atomic_bool geometryEventsPending_{false};
+    osfsmp::GeometryWake geometryWake_; // physics thread, under stepMutex_
     std::unordered_map<btRigidBody*,std::size_t> index_;
     std::unordered_set<btRigidBody*> ignoredBodies_;
     std::vector<BodyMetadata> meta_;
@@ -1294,12 +1359,24 @@ WindAdapter g_adapter;
 // release of cached NiPointers with its active FSMP PreStep callback.
 class SceneTransitionSink final :
     public RE::BSTEventSink<RE::MenuOpenCloseEvent>,
-    public RE::BSTEventSink<RE::TESCellAttachDetachEvent> {
+    public RE::BSTEventSink<RE::TESCellAttachDetachEvent>,
+    public RE::BSTEventSink<RE::TESEquipEvent>,
+    public RE::BSTEventSink<RE::TESObjectLoadedEvent> {
 public:
     RE::BSEventNotifyControl ProcessEvent(const RE::MenuOpenCloseEvent* event,
         RE::BSTEventSource<RE::MenuOpenCloseEvent>*) override {
         if(event && event->menuName==RE::LoadingMenu::MENU_NAME)
             g_adapter.OnLoadingMenu(event->opening);
+        return RE::BSEventNotifyControl::kContinue;
+    }
+    RE::BSEventNotifyControl ProcessEvent(const RE::TESEquipEvent* event,
+        RE::BSTEventSource<RE::TESEquipEvent>*) override {
+        if(event && event->actor)g_adapter.OnGeometryChanged(event->actor->GetFormID());
+        return RE::BSEventNotifyControl::kContinue;
+    }
+    RE::BSEventNotifyControl ProcessEvent(const RE::TESObjectLoadedEvent* event,
+        RE::BSTEventSource<RE::TESObjectLoadedEvent>*) override {
+        if(event && event->loaded)g_adapter.OnGeometryChanged(event->formID);
         return RE::BSEventNotifyControl::kContinue;
     }
     RE::BSEventNotifyControl ProcessEvent(const RE::TESCellAttachDetachEvent* event,
@@ -1347,8 +1424,11 @@ void OnMessage(SKSE::MessagingInterface::Message* msg){
         case SKSE::MessagingInterface::kDataLoaded:
             if(auto* ui=RE::UI::GetSingleton())
                 ui->AddEventSink<RE::MenuOpenCloseEvent>(&g_transitionSink);
-            if(auto* holder=RE::ScriptEventSourceHolder::GetSingleton())
+            if(auto* holder=RE::ScriptEventSourceHolder::GetSingleton()){
                 holder->AddEventSink<RE::TESCellAttachDetachEvent>(&g_transitionSink);
+                holder->AddEventSink<RE::TESEquipEvent>(&g_transitionSink);
+                holder->AddEventSink<RE::TESObjectLoadedEvent>(&g_transitionSink);
+            }
             if(!g_fsmpStartupSeen.load(std::memory_order_acquire) &&
                !g_fsmpMissingStartupWarned.exchange(true,std::memory_order_acq_rel)){
                 WIND_LOG_WARN("FSMP MSG_STARTUP not received by SKSE DataLoaded; wind integration unavailable. Check hdtsmp64.dll loading and FSMP startup logs");

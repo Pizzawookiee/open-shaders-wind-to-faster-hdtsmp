@@ -18,6 +18,7 @@ struct BodyRequest {
     float segmentLength{};
     RE::NiPointer<RE::NiNode> systemRoot;
     RE::NiPointer<RE::NiNode> boneNode;
+    bool refreshArea{}; // event window: bypass cached triangle areas
 };
 struct BodyBinding {
     std::uintptr_t body{};

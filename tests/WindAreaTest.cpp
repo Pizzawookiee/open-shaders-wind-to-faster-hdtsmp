@@ -16,6 +16,19 @@ int main() {
     std::array<float,2> areas{};
     AccumulateTriangleAreas(vertices,indices,areas);
     assert(std::abs(areas[0]-4.0f)<1e-5f && std::abs(areas[1]-2.0f)<1e-5f);
+    // Uniform scaling must preserve attribution and scale every area by s^2.
+    areas.fill(0.f);
+    AccumulateTriangleAreas(vertices,indices,areas,2.f);
+    assert(std::abs(areas[0]-16.f)<1e-5f && std::abs(areas[1]-8.f)<1e-5f);
+    areas.fill(0.f);
+    AccumulateTriangleAreas(vertices,indices,areas,0.5f);
+    assert(std::abs(areas[0]-1.f)<1e-5f && std::abs(areas[1]-0.5f)<1e-5f);
+    areas.fill(0.f);
+    AccumulateTriangleAreas(vertices,indices,areas,0.f);
+    AccumulateTriangleAreas(vertices,indices,areas,-1.f);
+    AccumulateTriangleAreas(vertices,indices,areas,NAN);
+    AccumulateTriangleAreas(vertices,indices,areas,INFINITY);
+    assert(areas[0]==0.f && areas[1]==0.f);
     vertices[1].rigBone[1]=1;vertices[1].weight[0]=0.5f;vertices[1].weight[1]=0.5f;
     areas.fill(0);
     AccumulateTriangleAreas(vertices,indices,areas);

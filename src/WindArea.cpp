@@ -7,14 +7,19 @@
 
 namespace osfsmp {
 void AccumulateTriangleAreas(std::span<const AreaVertex> vertices,
-    std::span<const std::uint32_t> indices, std::span<float> accumulated)
+    std::span<const std::uint32_t> indices, std::span<float> accumulated,float worldScale)
 {
+    // NIF coordinates are rest/model-space; uniform NiTransform scale affects
+    // area by s^2, not s. Do not apply a Havok conversion or per-bone pose here.
+    if(!std::isfinite(worldScale) || !(worldScale>0.f))return;
+    const float areaScale=worldScale*worldScale;
+    if(!std::isfinite(areaScale) || !(areaScale>0.f))return;
     for (std::size_t i = 0; i + 2 < indices.size(); i += 3) {
         const std::uint32_t a = indices[i], b = indices[i+1], c = indices[i+2];
         if (a >= vertices.size() || b >= vertices.size() || c >= vertices.size()) continue;
         const auto& A=vertices[a]; const auto& B=vertices[b]; const auto& C=vertices[c];
         if (!Finite(A.position) || !Finite(B.position) || !Finite(C.position)) continue;
-        const float triangle = 0.5f * Length(Cross(B.position-A.position, C.position-A.position));
+        const float triangle = 0.5f * Length(Cross(B.position-A.position, C.position-A.position)) * areaScale;
         if (!(triangle > 0.0f) || !std::isfinite(triangle) || triangle > 1.0e7f) continue;
         for (const AreaVertex* vert : {&A, &B, &C}) {
             float total=0.0f;

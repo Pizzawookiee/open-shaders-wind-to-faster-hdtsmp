@@ -10,6 +10,7 @@
 #include <Windows.h>  // Guard reads from incomplete/detaching skin instances.
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -112,6 +113,8 @@ std::uint64_t AreaFingerprint(RE::NiAVObject* root,
     RE::BSVisit::TraverseScenegraphGeometries(root,[&](RE::BSGeometry* geometry){
         HashMix(hash,reinterpret_cast<std::uintptr_t>(geometry));
         if(geometry){
+            // Uniform world-scale changes invalidate rest-area measurements.
+            HashMix(hash,std::bit_cast<std::uint32_t>(geometry->world.scale));
             const auto* skin=geometry->GetGeometryRuntimeData().skinInstance.get();
             HashMix(hash,reinterpret_cast<std::uintptr_t>(skin));
             // Skin bindings may change without replacing the geometry or partition.
@@ -411,7 +414,7 @@ void CollectSkinAreas(RE::NiAVObject* root, RE::NiAVObject* systemRoot,
             std::vector<std::uint32_t> indices;
             indices.reserve(static_cast<std::size_t>(part.triangles)*3);
             for(std::uint32_t t=0;t<static_cast<std::uint32_t>(part.triangles)*3;++t)indices.push_back(part.triList[t]);
-            AccumulateTriangleAreas(vertices,indices,areas);
+            AccumulateTriangleAreas(vertices,indices,areas,geometry->world.scale);
         }
         return RE::BSVisit::BSVisitControl::kContinue;
     });
@@ -546,7 +549,10 @@ SceneResult ScanScene(std::span<const BodyRequest> bodies,
         stats.bodyCount=static_cast<std::uint32_t>(byNode.size());
         const auto fingerprint=AreaFingerprint(geometryRoot,byName,bodies);
         auto found=g_areaCache.find(id);
-        if(found!=g_areaCache.end() && found->second.root==reinterpret_cast<std::uintptr_t>(geometryRoot) &&
+        const bool refresh=std::any_of(indices.begin(),indices.end(),[&](std::size_t idx){
+            return bodies[idx].refreshArea;
+        });
+        if(!refresh && found!=g_areaCache.end() && found->second.root==reinterpret_cast<std::uintptr_t>(geometryRoot) &&
            found->second.fingerprint==fingerprint){
             stats.fromCache=true;
             for(const auto idx:indices){

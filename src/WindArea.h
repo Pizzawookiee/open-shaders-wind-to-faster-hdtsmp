@@ -17,7 +17,7 @@ struct AreaVertex {
 };
 void AccumulateTriangleAreas(std::span<const AreaVertex> vertices,
     std::span<const std::uint32_t> indices,
-    std::span<float> accumulated);
+    std::span<float> accumulated, float worldScale = 1.0f);
 float EffectiveWindArea(float measuredArea, float segmentLength,
     float defaultWidth = 3.0f, bool allowSegmentFallback = false);
 float HalfToFloat(std::uint16_t bits) noexcept;
